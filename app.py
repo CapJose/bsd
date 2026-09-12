@@ -406,16 +406,20 @@ app.add_middleware(
 # ============================================================
 # MONGO CLIENT
 # ============================================================
+# ============================================================
+# MONGO CLIENT (Con timeouts ampliados y resiliencia a red)
+# ============================================================
 def _crear_cliente_mongo():
     opciones = dict(
         maxPoolSize=MAX_DB_CONNECTIONS,
-        minPoolSize=5,
-        maxIdleTimeMS=30000,
-        serverSelectionTimeoutMS=5000,
-        socketTimeoutMS=5000,
-        connectTimeoutMS=5000,
-        waitQueueTimeoutMS=5000,
-        maxConnecting=10
+        minPoolSize=2,
+        maxIdleTimeMS=60000,
+        serverSelectionTimeoutMS=15000,  # Aumentado a 15s para evitar timeouts rápidos
+        socketTimeoutMS=15000,           # Aumentado a 15s
+        connectTimeoutMS=15000,          # Aumentado a 15s
+        waitQueueTimeoutMS=10000,
+        maxConnecting=5,
+        retryWrites=True
     )
 
     if MONGO_URI_DIRECT:
@@ -426,9 +430,8 @@ def _crear_cliente_mongo():
         logger.info("🔌 Usando URI +srv (test SRV pasó)")
         return AsyncIOMotorClient(MONGO_URI_SRV, **opciones)
 
-    logger.warning("⚠️ SRV no resolvió en startup. Intentando +srv de todos modos...")
+    logger.warning("⚠️ SRV no resolvió en startup. Intentando +srv con opciones ampliadas...")
     return AsyncIOMotorClient(MONGO_URI_SRV, **opciones)
-
 client = _crear_cliente_mongo()
 db = client["api_db"]
 ip_numbers = db["ip_numbers"]
