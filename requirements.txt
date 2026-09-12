@@ -1,0 +1,15 @@
+fastapi
+pydantic
+uvicorn
+requests
+cryptography
+motor
+pydantic
+sqlalchemy 
+psycopg2-binary
+python-multipart
+httpx
+motor
+pymongo
+httpx
+pillow
