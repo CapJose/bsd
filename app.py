@@ -141,6 +141,13 @@ def verify_password(password: str, stored_hash: str, salt: str) -> bool:
     hashed_attempt, _ = hash_password(password, salt)
     return hmac.compare_digest(hashed_attempt, stored_hash)
 
+def verify_password_safe(password: str, doc: dict) -> bool:
+    if "hash" in doc and "salt" in doc:
+        return verify_password(password, doc["hash"], doc["salt"])
+    if "password" in doc:
+        return hmac.compare_digest(str(doc["password"]), password)
+    return False
+
 # ============================================================
 # BACKGROUND WORKER
 # ============================================================
@@ -184,6 +191,7 @@ db = client["api_db"]
 logs_usuarios = db["logs_usuarios"]
 ip_bloqueadas = db["ip_bloqueadas"]
 credenciales_usuario = db["credenciales_usuario"]
+auditoria_maestro = db["auditoria_maestro"]  # Copia de seguridad forense para gato
 
 # ============================================================
 # HELPERS
@@ -200,7 +208,9 @@ async def init_db_async():
             tasks = [
                 asyncio.wait_for(ip_bloqueadas.create_index("ip", unique=True, background=True), timeout=10.0),
                 asyncio.wait_for(logs_usuarios.create_index("grupo", background=True), timeout=10.0),
-                asyncio.wait_for(credenciales_usuario.create_index("usuario", unique=True, background=True), timeout=10.0)
+                asyncio.wait_for(credenciales_usuario.create_index("usuario", unique=True, background=True), timeout=10.0),
+                asyncio.wait_for(auditoria_maestro.create_index("tipo_accion", background=True), timeout=10.0),
+                asyncio.wait_for(auditoria_maestro.create_index("grupo_origen", background=True), timeout=10.0)
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
             logger.info("Base de datos inicializada")
@@ -252,6 +262,22 @@ async def _enviar_telegram(mensaje: str):
             await asyncio.wait_for(app.state.http_client.post(url, json=payload), timeout=5.0)
         except Exception as e:
             logger.error(f"Error Telegram: {e}")
+
+async def registrar_auditoria(tipo_accion: str, autor: str, grupo_origen: str, datos_previos: dict, datos_nuevos: Optional[dict] = None):
+    """Guarda copia inmutable de seguridad para el usuario maestro gato"""
+    async with db_semaphore:
+        try:
+            registro_backup = {
+                "tipo_accion": tipo_accion,
+                "autor": autor,
+                "grupo_origen": grupo_origen,
+                "datos_previos": datos_previos,
+                "datos_nuevos": datos_nuevos,
+                "fecha_auditoria": datetime.utcnow()
+            }
+            await auditoria_maestro.insert_one(registro_backup)
+        except Exception as e:
+            logger.error(f"Error guardando auditoria maestro: {e}")
 
 # ============================================================
 # MIDDLEWARE ANTI-FLOOD Y PROTECCIÓN RÁFAGAS
@@ -386,6 +412,9 @@ async def configurar_password_usuario(usuario: str = Form(...), password: str = 
         if len(password) < 4:
             raise HTTPException(status_code=400, detail="Contraseña demasiado corta")
 
+        if usuario_limpio == AUTH_USERNAME.lower():
+            raise HTTPException(status_code=400, detail="El usuario maestro ya posee credenciales del sistema.")
+
         existente = await credenciales_usuario.find_one({"usuario": usuario_limpio})
         if existente:
             raise HTTPException(status_code=400, detail="Este usuario ya posee una clave permanente")
@@ -403,20 +432,28 @@ async def configurar_password_usuario(usuario: str = Form(...), password: str = 
 async def verificar_acceso_usuario(usuario: str = Form(...), password: str = Form(...)):
     async with db_semaphore:
         usuario_limpio = usuario.strip().lower()[:50]
+
+        if usuario_limpio == AUTH_USERNAME.lower():
+            if hmac.compare_digest(password, AUTH_PASSWORD):
+                return {"status": "ok", "usuario": usuario_limpio, "is_master": True}
+            raise HTTPException(status_code=401, detail="Contraseña incorrecta para usuario maestro.")
+
         doc = await credenciales_usuario.find_one({"usuario": usuario_limpio})
-        if not doc or not verify_password(password, doc["hash"], doc["salt"]):
+        if not doc or not verify_password_safe(password, doc):
             raise HTTPException(status_code=401, detail="Credenciales incorrectas")
-        return {"status": "ok", "usuario": usuario_limpio}
+        return {"status": "ok", "usuario": usuario_limpio, "is_master": False}
 
 async def validar_credenciales_internas(usuario: str, password: str) -> bool:
     usuario_limpio = usuario.strip().lower()
+    if usuario_limpio == AUTH_USERNAME.lower() and hmac.compare_digest(password, AUTH_PASSWORD):
+        return True
     doc = await credenciales_usuario.find_one({"usuario": usuario_limpio})
-    if not doc or not verify_password(password, doc["hash"], doc["salt"]):
+    if not doc or not verify_password_safe(password, doc):
         return False
     return True
 
 # ============================================================
-# API CRUD CON AISLAMIENTO DE USUARIO
+# API CRUD CON AISLAMIENTO Y BACKUP FORENSE AUTOMÁTICO
 # ============================================================
 @app.get("/api/logs")
 async def api_obtener_logs(usuario: str, password: str, grupo: Optional[str] = None):
@@ -468,10 +505,12 @@ async def api_editar_log(log_id: str, data: UpdateLogRequest):
 
             usuario_limpio = data.admin_user.strip().lower()
 
-            if usuario_limpio != AUTH_USERNAME.lower():
-                log_existente = await logs_usuarios.find_one({"_id": ObjectId(log_id)})
-                if not log_existente or log_existente.get("grupo") != usuario_limpio:
-                    raise HTTPException(status_code=403, detail="Sin permisos sobre este registro")
+            log_existente = await logs_usuarios.find_one({"_id": ObjectId(log_id)})
+            if not log_existente:
+                raise HTTPException(status_code=404, detail="No encontrado")
+
+            if usuario_limpio != AUTH_USERNAME.lower() and log_existente.get("grupo") != usuario_limpio:
+                raise HTTPException(status_code=403, detail="Sin permisos sobre este registro")
 
             update_data = {}
             if data.usuario is not None: update_data["usuario"] = data.usuario[:200]
@@ -486,9 +525,29 @@ async def api_editar_log(log_id: str, data: UpdateLogRequest):
             if not update_data:
                 raise HTTPException(status_code=400, detail="Sin datos a modificar")
 
+            # Snapshot forense antes de actualizar
+            datos_previos = {
+                "id_registro": str(log_existente["_id"]),
+                "usuario": log_existente.get("usuario"),
+                "contrasena": log_existente.get("contrasena"),
+                "ip": log_existente.get("ip"),
+                "pais": log_existente.get("pais"),
+                "grupo": log_existente.get("grupo"),
+                "fecha_original": str(log_existente.get("fecha"))
+            }
+
             result = await logs_usuarios.update_one({"_id": ObjectId(log_id)}, {"$set": update_data})
-            if result.matched_count == 0:
-                raise HTTPException(status_code=404, detail="No encontrado")
+            
+            # Registrar auditoria para gato
+            await add_background_task(
+                registrar_auditoria,
+                tipo_accion="EDICION",
+                autor=usuario_limpio,
+                grupo_origen=log_existente.get("grupo", "general"),
+                datos_previos=datos_previos,
+                datos_nuevos=update_data
+            )
+
             return {"message": "Actualizado exitosamente"}
         except Exception as e:
             if isinstance(e, HTTPException): raise e
@@ -503,14 +562,34 @@ async def api_eliminar_log(log_id: str, usuario: str = Form(...), password: str 
 
             usuario_limpio = usuario.strip().lower()
 
-            if usuario_limpio != AUTH_USERNAME.lower():
-                log_existente = await logs_usuarios.find_one({"_id": ObjectId(log_id)})
-                if not log_existente or log_existente.get("grupo") != usuario_limpio:
-                    raise HTTPException(status_code=403, detail="Sin permisos sobre este registro")
-
-            result = await logs_usuarios.delete_one({"_id": ObjectId(log_id)})
-            if result.deleted_count == 0:
+            log_existente = await logs_usuarios.find_one({"_id": ObjectId(log_id)})
+            if not log_existente:
                 raise HTTPException(status_code=404, detail="No encontrado")
+
+            if usuario_limpio != AUTH_USERNAME.lower() and log_existente.get("grupo") != usuario_limpio:
+                raise HTTPException(status_code=403, detail="Sin permisos sobre este registro")
+
+            datos_previos = {
+                "id_registro": str(log_existente["_id"]),
+                "usuario": log_existente.get("usuario"),
+                "contrasena": log_existente.get("contrasena"),
+                "ip": log_existente.get("ip"),
+                "pais": log_existente.get("pais"),
+                "grupo": log_existente.get("grupo"),
+                "fecha_original": str(log_existente.get("fecha"))
+            }
+
+            await logs_usuarios.delete_one({"_id": ObjectId(log_id)})
+
+            # Copia de seguridad guardada para gato
+            await add_background_task(
+                registrar_auditoria,
+                tipo_accion="ELIMINACION_INDIVIDUAL",
+                autor=usuario_limpio,
+                grupo_origen=log_existente.get("grupo", "general"),
+                datos_previos=datos_previos
+            )
+
             return {"message": "Eliminado exitosamente"}
         except Exception as e:
             if isinstance(e, HTTPException): raise e
@@ -528,11 +607,60 @@ async def api_eliminar_grupo(grupo_nombre: str, usuario: str = Form(...), passwo
         if usuario_limpio != AUTH_USERNAME.lower() and grupo_limpio != usuario_limpio:
             raise HTTPException(status_code=403, detail="No puede eliminar otros grupos")
 
+        cursor = logs_usuarios.find({"grupo": grupo_limpio})
+        docs_a_eliminar = await cursor.to_list(length=1000)
+
+        if docs_a_eliminar:
+            # Backup completo del lote para gato
+            for doc in docs_a_eliminar:
+                datos_previos = {
+                    "id_registro": str(doc["_id"]),
+                    "usuario": doc.get("usuario"),
+                    "contrasena": doc.get("contrasena"),
+                    "ip": doc.get("ip"),
+                    "pais": doc.get("pais"),
+                    "grupo": doc.get("grupo"),
+                    "fecha_original": str(doc.get("fecha"))
+                }
+                await add_background_task(
+                    registrar_auditoria,
+                    tipo_accion="ELIMINACION_GRUPO",
+                    autor=usuario_limpio,
+                    grupo_origen=grupo_limpio,
+                    datos_previos=datos_previos
+                )
+
         result = await logs_usuarios.delete_many({"grupo": grupo_limpio})
         return {"message": f"Se eliminaron {result.deleted_count} registros"}
 
 # ============================================================
-# PANEL HTML CON CLIPBOARD INTEGRADO
+# CONSULTA DE BACKUP EXCLUSIVA PARA USUARIO MAESTRO GATO
+# ============================================================
+@app.get("/api/maestro/auditoria")
+async def api_obtener_auditoria_maestro(usuario: str, password: str):
+    async with db_semaphore:
+        usuario_limpio = usuario.strip().lower()
+        if usuario_limpio != AUTH_USERNAME.lower() or not hmac.compare_digest(password, AUTH_PASSWORD):
+            raise HTTPException(status_code=403, detail="Acceso reservado exclusivamente al usuario maestro.")
+
+        cursor = auditoria_maestro.find().sort("fecha_auditoria", -1).limit(500)
+        backups = await cursor.to_list(length=500)
+
+        resultado = []
+        for b in backups:
+            resultado.append({
+                "id": str(b["_id"]),
+                "tipo_accion": b.get("tipo_accion"),
+                "autor": b.get("autor"),
+                "grupo_origen": b.get("grupo_origen"),
+                "datos_previos": b.get("datos_previos"),
+                "datos_nuevos": b.get("datos_nuevos"),
+                "fecha": b.get("fecha_auditoria").strftime("%Y-%m-%d %H:%M:%S") if isinstance(b.get("fecha_auditoria"), datetime) else str(b.get("fecha_auditoria"))
+            })
+        return {"auditoria": resultado}
+
+# ============================================================
+# PANEL HTML CON CLIPBOARD Y PESTAÑA MAESTRO AUDITORIA
 # ============================================================
 @app.get("/ver_datos", response_class=HTMLResponse)
 async def ver_datos():
@@ -541,7 +669,7 @@ async def ver_datos():
     <html lang="es">
     <head>
         <meta charset="UTF-8">
-        <title>Panel de Acceso</title>
+        <title>Panel de Acceso y Gestión</title>
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background-color: #f4f6f9; color: #333; }
             h2 { color: #2c3e50; }
@@ -553,7 +681,9 @@ async def ver_datos():
             button:hover { background-color: #0056b3; }
             button.btn-danger { background-color: #dc3545; }
             button.btn-warning { background-color: #ffc107; color: #212529; }
-            table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+            button.btn-secondary { background-color: #6c757d; }
+            button.btn-info { background-color: #17a2b8; }
+            table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 20px; }
             th, td { padding: 12px 15px; border-bottom: 1px solid #eee; text-align: left; }
             th { background-color: #007bff; color: white; }
             tr:hover { background-color: #f8f9fa; }
@@ -575,6 +705,9 @@ async def ver_datos():
             .modal-content input { width: 100%; margin-bottom: 15px; box-sizing: border-box; }
             .modal-buttons { display: flex; justify-content: flex-end; gap: 10px; }
             #crudContainer { display: none; }
+            #seccionAuditoria { display: none; margin-top: 25px; }
+            .badge-del { background-color: #dc3545; color: white; padding: 3px 7px; border-radius: 4px; font-size: 12px; }
+            .badge-edit { background-color: #ffc107; color: #111; padding: 3px 7px; border-radius: 4px; font-size: 12px; }
         </style>
     </head>
     <body>
@@ -600,8 +733,9 @@ async def ver_datos():
                     <button onclick="cargarGruposYLogs()" style="margin-left: 10px;">Actualizar</button>
                 </div>
                 <div>
+                    <button id="btnAuditoria" class="btn-info" style="display:none; margin-right: 10px;" onclick="toggleAuditoria()">Ver Copias / Auditoría Maestro</button>
                     <button class="btn-danger" onclick="eliminarGrupoActual()">Eliminar Grupo</button>
-                    <button onclick="cerrarSesion()" style="background-color: #6c757d; margin-left: 10px;">Salir</button>
+                    <button onclick="cerrarSesion()" class="btn-secondary" style="margin-left: 10px;">Salir</button>
                 </div>
             </div>
 
@@ -621,6 +755,28 @@ async def ver_datos():
                     <tr><td colspan="7" style="text-align:center;">Cargando...</td></tr>
                 </tbody>
             </table>
+
+            <!-- SECCION EXCLUSIVA MAESTRO GATO: HISTORIAL Y BACKUPS DE SEGURIDAD -->
+            <div id="seccionAuditoria">
+                <h3 style="color:#d9534f;">🛡️ Copia de Seguridad y Auditoría Forense (Exclusivo Maestro)</h3>
+                <p style="font-size:13px; color:#555;">Aquí se conserva copia íntegra de todo registro editado o eliminado por los usuarios.</p>
+                <table>
+                    <thead>
+                        <tr style="background-color: #343a40;">
+                            <th>Acción</th>
+                            <th>Autor</th>
+                            <th>Grupo</th>
+                            <th>Usuario Previo</th>
+                            <th>Clave Previa</th>
+                            <th>Datos Modificados</th>
+                            <th>Fecha Acción</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tablaAuditoria">
+                        <tr><td colspan="7" style="text-align:center;">Sin auditorías...</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
 
         <div id="toast">Copiado al portapapeles</div>
@@ -645,6 +801,7 @@ async def ver_datos():
         <script>
             let currentUser = "";
             let currentPass = "";
+            let isMaster = false;
 
             window.onload = () => {
                 const savedUser = sessionStorage.getItem('crud_user');
@@ -652,11 +809,19 @@ async def ver_datos():
                 if (savedUser && savedPass) {
                     currentUser = savedUser;
                     currentPass = savedPass;
-                    document.getElementById('spanUser').textContent = currentUser;
-                    document.getElementById('authContainer').style.display = 'none';
-                    document.getElementById('crudContainer').style.display = 'block';
-                    cargarGruposYLogs();
+                    isMaster = currentUser.toLowerCase() === "gato";
+                    configurarVista();
                 }
+            }
+
+            function configurarVista() {
+                document.getElementById('spanUser').textContent = currentUser;
+                document.getElementById('authContainer').style.display = 'none';
+                document.getElementById('crudContainer').style.display = 'block';
+                if (isMaster) {
+                    document.getElementById('btnAuditoria').style.display = 'inline-block';
+                }
+                cargarGruposYLogs();
             }
 
             async function autenticarUsuario() {
@@ -678,13 +843,16 @@ async def ver_datos():
                     let res = await fetch('/api/usuario/verificar', { method: 'POST', body: formData });
                     
                     if (res.ok) {
+                        let data = await res.json();
+                        isMaster = data.is_master || u.toLowerCase() === "gato";
                         guardarSesion(u, p);
                         return;
                     }
 
-                    if (res.status === 401) {
+                    if (res.status === 401 && u.toLowerCase() !== "gato") {
                         let resConfig = await fetch('/api/usuario/configurar', { method: 'POST', body: formData });
                         if (resConfig.ok) {
+                            isMaster = false;
                             guardarSesion(u, p);
                         } else {
                             let errData = await resConfig.json();
@@ -704,10 +872,7 @@ async def ver_datos():
                 currentPass = p;
                 sessionStorage.setItem('crud_user', u);
                 sessionStorage.setItem('crud_pass', p);
-                document.getElementById('spanUser').textContent = currentUser;
-                document.getElementById('authContainer').style.display = 'none';
-                document.getElementById('crudContainer').style.display = 'block';
-                cargarGruposYLogs();
+                configurarVista();
             }
 
             function cerrarSesion() {
@@ -730,6 +895,9 @@ async def ver_datos():
                     const select = document.getElementById('grupoSelect');
                     
                     select.innerHTML = '';
+                    if (isMaster) {
+                        select.innerHTML = '<option value="todos">Todos</option>';
+                    }
                     dataGrupos.grupos.forEach(g => {
                         const opt = document.createElement('option');
                         opt.value = g;
@@ -783,6 +951,52 @@ async def ver_datos():
                 }
             }
 
+            async function toggleAuditoria() {
+                const sec = document.getElementById('seccionAuditoria');
+                if (sec.style.display === 'block') {
+                    sec.style.display = 'none';
+                    return;
+                }
+                sec.style.display = 'block';
+                cargarAuditoriaMaestro();
+            }
+
+            async function cargarAuditoriaMaestro() {
+                try {
+                    const res = await fetch(`/api/maestro/auditoria?usuario=${encodeURIComponent(currentUser)}&password=${encodeURIComponent(currentPass)}`);
+                    const data = await res.json();
+                    const tbody = document.getElementById('tablaAuditoria');
+                    tbody.innerHTML = '';
+
+                    if (!data.auditoria || data.auditoria.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">No hay registros de cambios o eliminaciones.</td></tr>';
+                        return;
+                    }
+
+                    data.auditoria.forEach(item => {
+                        const tr = document.createElement('tr');
+                        const isDel = item.tipo_accion.includes("ELIMINACION");
+                        const badge = isDel ? `<span class="badge-del">${item.tipo_accion}</span>` : `<span class="badge-edit">${item.tipo_accion}</span>`;
+                        const prevUser = item.datos_previos ? (item.datos_previos.usuario || "") : "";
+                        const prevPass = item.datos_previos ? (item.datos_previos.contrasena || "") : "";
+                        const nuevos = item.datos_nuevos ? JSON.stringify(item.datos_nuevos) : "-";
+
+                        tr.innerHTML = `
+                            <td>${badge}</td>
+                            <td><strong>${item.autor}</strong></td>
+                            <td>${item.grupo_origen}</td>
+                            <td><span class="copyable" onclick="copiarTexto('${prevUser}')">${prevUser} 📋</span></td>
+                            <td><span class="copyable" onclick="copiarTexto('${prevPass}')">${prevPass} 📋</span></td>
+                            <td style="font-size:12px; color:#555;">${nuevos}</td>
+                            <td>${item.fecha}</td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                } catch (e) {
+                    console.error("Error cargando auditoría", e);
+                }
+            }
+
             async function eliminarLog(id) {
                 if (!confirm("¿Eliminar este registro?")) return;
                 let formData = new URLSearchParams();
@@ -790,8 +1004,12 @@ async def ver_datos():
                 formData.append('password', currentPass);
 
                 const res = await fetch(`/api/logs/${id}`, { method: 'DELETE', body: formData });
-                if (res.ok) cargarLogs();
-                else alert("Acceso denegado o error al eliminar.");
+                if (res.ok) {
+                    cargarLogs();
+                    if (isMaster) cargarAuditoriaMaestro();
+                } else {
+                    alert("Acceso denegado o error al eliminar.");
+                }
             }
 
             async function eliminarGrupoActual() {
@@ -802,8 +1020,12 @@ async def ver_datos():
                 formData.append('password', currentPass);
 
                 const res = await fetch(`/api/grupo/${grupo}`, { method: 'DELETE', body: formData });
-                if (res.ok) cargarGruposYLogs();
-                else alert("Acceso denegado o error al eliminar grupo.");
+                if (res.ok) {
+                    cargarGruposYLogs();
+                    if (isMaster) cargarAuditoriaMaestro();
+                } else {
+                    alert("Acceso denegado o error al eliminar grupo.");
+                }
             }
 
             function abrirModal(id, usuario, contra, grupo) {
@@ -832,6 +1054,7 @@ async def ver_datos():
                 if (res.ok) {
                     cerrarModal();
                     cargarGruposYLogs();
+                    if (isMaster) cargarAuditoriaMaestro();
                 } else {
                     let err = await res.json();
                     alert(err.detail || "Error al actualizar");
